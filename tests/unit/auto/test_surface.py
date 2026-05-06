@@ -546,8 +546,8 @@ async def test_cli_resume_replays_persisted_runtime_and_skip_run(monkeypatch, tm
         goal=None,
         resume=state.auto_session_id,
         runtime=None,
-        max_interview_rounds=1,
-        max_repair_rounds=1,
+        max_interview_rounds=None,
+        max_repair_rounds=None,
         skip_run=False,
     )
 
@@ -604,8 +604,8 @@ async def test_cli_resume_migrates_legacy_session_without_runtime_backend(
         goal=None,
         resume=state.auto_session_id,
         runtime=None,
-        max_interview_rounds=1,
-        max_repair_rounds=1,
+        max_interview_rounds=None,
+        max_repair_rounds=None,
         skip_run=False,
     )
 
@@ -661,8 +661,8 @@ async def test_cli_resume_infers_opencode_for_legacy_session_with_opencode_mode(
         goal=None,
         resume=state.auto_session_id,
         runtime=None,
-        max_interview_rounds=1,
-        max_repair_rounds=1,
+        max_interview_rounds=None,
+        max_repair_rounds=None,
         skip_run=False,
     )
 
