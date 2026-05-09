@@ -10,6 +10,8 @@ from typing import Any
 
 from ouroboros.auto.adapters import (
     HandlerInterviewBackend,
+    HandlerRalphPoller,
+    HandlerRalphStarter,
     HandlerRunStarter,
     HandlerSeedGenerator,
     load_seed,
@@ -36,6 +38,7 @@ from ouroboros.core.types import Result
 from ouroboros.mcp.errors import MCPServerError, MCPToolError
 from ouroboros.mcp.tools.authoring_handlers import GenerateSeedHandler, InterviewHandler
 from ouroboros.mcp.tools.execution_handlers import ExecuteSeedHandler, StartExecuteSeedHandler
+from ouroboros.mcp.tools.ralph_handlers import RalphHandler
 from ouroboros.mcp.types import (
     ContentType,
     MCPContentItem,
@@ -159,6 +162,18 @@ class AutoHandler:
                     ),
                     required=False,
                 ),
+                MCPToolParameter(
+                    "complete_product",
+                    ToolInputType.BOOLEAN,
+                    (
+                        "When true, chain RUN → RALPH_HANDOFF after a successful run "
+                        "handoff so a single ouroboros_auto invocation iterates Ralph "
+                        "until QA passes, convergence, or a budget bound trips. "
+                        "Defaults to false (opt-in)."
+                    ),
+                    required=False,
+                    default=False,
+                ),
             ),
         )
 
@@ -186,6 +201,7 @@ class AutoHandler:
         store = self.store or AutoStore()
         resume = arguments.get("resume")
         requested_skip_run = bool(arguments.get("skip_run", False))
+        complete_product = bool(arguments.get("complete_product", False))
         attach_execution = _optional_text_arg(arguments, "attach_execution")
         attach_job = _optional_text_arg(arguments, "attach_job")
         attach_session = _optional_text_arg(arguments, "attach_session")
@@ -233,6 +249,15 @@ class AutoHandler:
             # the same input converges to the same Seed.
             if user_preferences_supplied:
                 state.user_preferences = dict(supplied_user_preferences)
+            # Q00/ouroboros#773 (review-3): ``complete_product`` is durable
+            # session intent, not a per-invocation flag. Honor the persisted
+            # value so MCP callers that omit ``complete_product`` on resume
+            # still chain RUN → RALPH_HANDOFF for sessions that originally
+            # opted in. Mirrors the CLI policy in ``cli/commands/auto.py``.
+            if state.complete_product and not complete_product:
+                complete_product = True
+            elif complete_product and not state.complete_product:
+                state.complete_product = True
         else:
             goal = arguments.get("goal")
             if not isinstance(goal, str) or not goal.strip():
@@ -247,6 +272,7 @@ class AutoHandler:
             state.user_preferences = dict(supplied_user_preferences)
             state.max_interview_rounds = max_interview_rounds
             state.max_repair_rounds = max_repair_rounds
+            state.complete_product = complete_product
             if pipeline_timeout_seconds is not None:
                 state.pipeline_timeout_seconds = pipeline_timeout_seconds
         state.runtime_backend = runtime_backend
@@ -283,6 +309,23 @@ class AutoHandler:
             timeout_seconds=state.phase_timeout_seconds(AutoPhase.INTERVIEW),
             context_provider=context_provider,
         )
+        ralph_handler = (
+            RalphHandler(
+                agent_runtime_backend=runtime_backend,
+                opencode_mode=opencode_mode,
+            )
+            if complete_product
+            else None
+        )
+        ralph_starter = HandlerRalphStarter(ralph_handler) if ralph_handler is not None else None
+        # Q00/ouroboros#773 (review-5 finding 1): wire a poller backed by the
+        # same ``RalphHandler`` so MCP-side resumes of an interrupted
+        # ``RALPH_HANDOFF`` checkpoint actually reconcile the persisted job
+        # to a terminal auto phase. The same handler is reused so both the
+        # starter and the poller share a ``JobManager`` (and underlying
+        # ``EventStore``) — without that share the poller would query a
+        # fresh, empty job table.
+        ralph_resumer = HandlerRalphPoller(ralph_handler) if ralph_handler is not None else None
         pipeline = AutoPipeline(
             driver,
             HandlerSeedGenerator(generate_seed_handler),
@@ -298,6 +341,9 @@ class AutoHandler:
             attach_source=attach_source,
             reconcile_run=reconcile_run,
             reconcile_source=reconcile_source,
+            ralph_starter=ralph_starter,
+            ralph_resumer=ralph_resumer,
+            complete_product=complete_product,
         )
         return await pipeline.run(state)
 
@@ -344,6 +390,18 @@ def _result_meta(result: AutoPipelineResult) -> dict[str, Any]:
         meta["run_reconciliation_status"] = result.run_reconciliation_status
         meta["run_reconciliation_source"] = result.run_reconciliation_source
         meta["run_reconciled_at"] = result.run_reconciled_at
+    # Q00/ouroboros#773 (review-4): surface Ralph handoff tracking handles on
+    # the MCP result contract. Without these, plugin-mode dispatches and
+    # mid-loop checkpoints expose no structured handle for clients to monitor
+    # or correlate the Ralph work, forcing them to read local state files
+    # out-of-band. Each field is emitted only when populated so default-off
+    # ``complete_product=False`` runs keep the legacy meta shape byte-identical.
+    if result.ralph_job_id:
+        meta["ralph_job_id"] = result.ralph_job_id
+    if result.ralph_lineage_id:
+        meta["ralph_lineage_id"] = result.ralph_lineage_id
+    if result.ralph_dispatch_mode:
+        meta["ralph_dispatch_mode"] = result.ralph_dispatch_mode
     # Always emit the ledger-provenance surface so MCP clients can distinguish
     # "computed and empty" (no resolved sections yet, or no per-source split
     # available) from "field not provided at all".  Empty containers are part
@@ -614,6 +672,14 @@ def _format_result(result: AutoPipelineResult) -> str:
         lines.append(f"Run reconciliation status: {result.run_reconciliation_status}")
         lines.append(f"Run reconciliation source: {result.run_reconciliation_source}")
         lines.append(f"Run reconciled at: {result.run_reconciled_at}")
+    if result.ralph_dispatch_mode or result.ralph_job_id or result.ralph_lineage_id:
+        lines.append("Ralph handoff:")
+        if result.ralph_dispatch_mode:
+            lines.append(f"  dispatch_mode: {result.ralph_dispatch_mode}")
+        if result.ralph_job_id:
+            lines.append(f"  job_id: {result.ralph_job_id}")
+        if result.ralph_lineage_id:
+            lines.append(f"  lineage_id: {result.ralph_lineage_id}")
     if result.assumptions:
         lines.append("Assumptions:")
         lines.extend(f"- {item}" for item in result.assumptions)

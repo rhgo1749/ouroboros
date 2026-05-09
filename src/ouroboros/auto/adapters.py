@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import yaml
 
 from ouroboros.auto.interview_driver import InterviewBackend, InterviewTurn
 from ouroboros.core.seed import Seed
 from ouroboros.mcp.errors import MCPServerError
+from ouroboros.mcp.job_manager import JobManager, JobStatus
 from ouroboros.mcp.tools.authoring_handlers import GenerateSeedHandler, InterviewHandler
 from ouroboros.mcp.tools.execution_handlers import StartExecuteSeedHandler
+from ouroboros.mcp.tools.ralph_handlers import RalphHandler
 from ouroboros.mcp.types import MCPToolResult
 
 
@@ -156,6 +161,161 @@ class HandlerRunStarter:
         if isinstance(meta.get("_subagent"), dict):
             run_meta["_subagent"] = meta["_subagent"]
         return run_meta
+
+
+class HandlerRalphStarter:
+    """Callable Ralph starter backed by ``ouroboros_ralph``.
+
+    Bridges :class:`AutoPipeline`'s RUN → RALPH_HANDOFF transition to the
+    runtime-owned Ralph loop introduced in Q00/ouroboros#528. Awaits the
+    background job to a terminal state in non-plugin runtimes so the auto
+    pipeline can produce a final ``COMPLETE`` / ``BLOCKED`` / ``FAILED``
+    auto phase from the same ``AutoPipeline.run()`` call. In plugin mode
+    the handler returns ``delegated_to_plugin`` immediately and the
+    pipeline records ``ralph_dispatch_mode="plugin"`` without invoking
+    job tools.
+    """
+
+    def __init__(self, handler: RalphHandler) -> None:
+        self.handler = handler
+
+    async def __call__(
+        self,
+        seed: Seed,
+        *,
+        lineage_id: str,
+        max_total_seconds: float | None = None,
+        per_iteration_timeout_seconds: float | None = None,
+        on_dispatched: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Dispatch the Ralph loop and wait for terminal completion.
+
+        ``on_dispatched`` is invoked with the dispatch envelope *before*
+        the wait-for-terminal poll begins, so callers (notably
+        :meth:`AutoPipeline._handoff_to_ralph`) can checkpoint
+        ``ralph_job_id`` / ``ralph_dispatch_mode`` immediately after the
+        background job has been created. Without this hook, a process
+        restart, deadline trip, or client disconnect *after* dispatch but
+        *before* terminal completion would leave the persisted state with
+        only ``ralph_lineage_id`` — and resume could not poll the
+        still-running job (Q00/ouroboros#773 review-6).
+        """
+        seed_yaml = yaml.dump(
+            seed.to_dict(), default_flow_style=False, allow_unicode=True, sort_keys=False
+        )
+        arguments: dict[str, Any] = {
+            "lineage_id": lineage_id,
+            "seed_content": seed_yaml,
+        }
+        if max_total_seconds is not None:
+            arguments["max_total_seconds"] = max_total_seconds
+        if per_iteration_timeout_seconds is not None:
+            arguments["per_iteration_timeout_seconds"] = per_iteration_timeout_seconds
+        result = _unwrap(
+            await self.handler.handle(arguments),
+            tool_name="ouroboros_ralph",
+        )
+        meta = result.meta or {}
+        dispatch_mode = _optional_str(meta.get("dispatch_mode"))
+        status = _optional_str(meta.get("status"))
+        # Plugin mode: handler returned an envelope with no job_id and a
+        # ``delegated_to_plugin`` status. The auto pipeline records this and
+        # transitions straight to COMPLETE — there is nothing to wait for.
+        if status == "delegated_to_plugin" or dispatch_mode == "plugin":
+            envelope = {
+                "job_id": None,
+                "lineage_id": _optional_str(meta.get("lineage_id")) or lineage_id,
+                "dispatch_mode": "plugin",
+                "terminal_status": "delegated_to_plugin",
+                "stop_reason": None,
+            }
+            if on_dispatched is not None:
+                on_dispatched(envelope)
+            return envelope
+        # Job mode: wait for the background job to terminate, then map the
+        # final job snapshot back into the structured terminal status the
+        # pipeline maps onto an auto phase.
+        job_id = _optional_str(meta.get("job_id"))
+        if not job_id:
+            raise HandlerError("ouroboros_ralph did not return a job_id")
+        if on_dispatched is not None:
+            # Fire BEFORE we block on the terminal poll so callers can
+            # persist ``ralph_job_id`` immediately. The terminal_status /
+            # stop_reason are intentionally omitted here — they are not
+            # known until the poll returns.
+            on_dispatched(
+                {
+                    "job_id": job_id,
+                    "lineage_id": _optional_str(meta.get("lineage_id")) or lineage_id,
+                    "dispatch_mode": "job",
+                }
+            )
+        job_manager = self.handler._job_manager  # noqa: SLF001
+        terminal_meta = await _wait_for_job_terminal(job_manager, job_id)
+        terminal_status = _optional_str(terminal_meta.get("status")) or "failed"
+        stop_reason = _optional_str(terminal_meta.get("stop_reason"))
+        return {
+            "job_id": job_id,
+            "lineage_id": _optional_str(meta.get("lineage_id")) or lineage_id,
+            "dispatch_mode": "job",
+            "terminal_status": terminal_status,
+            "stop_reason": stop_reason,
+        }
+
+
+class HandlerRalphPoller:
+    """Callable Ralph job poller backed by the same ``RalphHandler`` ``JobManager``.
+
+    Used by :class:`AutoPipeline` on resume from a persisted ``RALPH_HANDOFF``
+    checkpoint (Q00/ouroboros#773 review-5 finding 1). Without this hook a
+    long-lived runtime such as MCP — where the Ralph background job keeps
+    running after the client disconnects — would leave any interrupted
+    ``--complete-product`` session stranded in the non-terminal handoff
+    state forever, since the legacy resume path only emitted guidance text.
+    The poller waits for the persisted ``ralph_job_id`` to reach a terminal
+    snapshot and returns the same ``terminal_status`` / ``stop_reason`` /
+    ``dispatch_mode`` shape as :class:`HandlerRalphStarter` so the pipeline
+    can re-use a single COMPLETE / BLOCKED / FAILED mapping.
+    """
+
+    def __init__(self, handler: RalphHandler) -> None:
+        self.handler = handler
+
+    async def __call__(self, *, job_id: str) -> dict[str, Any]:
+        job_manager = self.handler._job_manager  # noqa: SLF001
+        terminal_meta = await _wait_for_job_terminal(job_manager, job_id)
+        terminal_status = _optional_str(terminal_meta.get("status")) or "failed"
+        stop_reason = _optional_str(terminal_meta.get("stop_reason"))
+        return {
+            "job_id": job_id,
+            "lineage_id": _optional_str(terminal_meta.get("lineage_id")),
+            "dispatch_mode": "job",
+            "terminal_status": terminal_status,
+            "stop_reason": stop_reason,
+        }
+
+
+async def _wait_for_job_terminal(
+    job_manager: JobManager, job_id: str, *, poll_interval: float = 0.05
+) -> dict[str, Any]:
+    """Poll the job manager until ``job_id`` reaches a terminal state.
+
+    Returns the materialized ``result_meta`` from the terminal snapshot so
+    callers can extract ralph's ``status`` / ``stop_reason``. ``status`` in
+    the returned mapping is always populated — it falls back to the job's
+    own terminal status (e.g. ``"failed"`` for an exception path) when the
+    inner ralph result did not provide one.
+    """
+    while True:
+        snapshot = await job_manager.get_snapshot(job_id)
+        if snapshot.is_terminal:
+            meta = dict(snapshot.result_meta or {})
+            meta.setdefault(
+                "status",
+                "completed" if snapshot.status is JobStatus.COMPLETED else "failed",
+            )
+            return meta
+        await asyncio.sleep(poll_interval)
 
 
 def load_seed(path: str | Path) -> Seed:

@@ -21,6 +21,7 @@ class AutoPhase(StrEnum):
     REVIEW = "review"
     REPAIR = "repair"
     RUN = "run"
+    RALPH_HANDOFF = "ralph_handoff"
     COMPLETE = "complete"
     BLOCKED = "blocked"
     FAILED = "failed"
@@ -67,11 +68,6 @@ DEFAULT_TIMEOUT_SECONDS_BY_PHASE: dict[str, int] = {
 DEFAULT_PIPELINE_TIMEOUT_SECONDS: float = 7200.0
 MIN_PIPELINE_TIMEOUT_SECONDS: float = 60.0
 MAX_PIPELINE_TIMEOUT_SECONDS: float = 86400.0
-# TODO(#773): on RALPH_HANDOFF, pipeline computes
-# max_total_seconds = max(0.0, deadline_at - time.monotonic()) and forwards it
-# to ouroboros_ralph as the field added in #777. Hook lives in pipeline.py at
-# the run-handoff site once #773 introduces the RALPH_HANDOFF transition.
-
 # Allowed keys for the optional gateway-provenance metadata recorded on auto state.
 # Strict allowlist: anything not listed here is dropped during redaction so that
 # tokens, credentials, or raw user utterances cannot be persisted by accident.
@@ -197,19 +193,31 @@ _ALLOWED_TRANSITIONS: dict[AutoPhase, set[AutoPhase]] = {
         AutoPhase.FAILED,
     },
     AutoPhase.REPAIR: {AutoPhase.REVIEW, AutoPhase.BLOCKED, AutoPhase.FAILED},
-    AutoPhase.RUN: {AutoPhase.COMPLETE, AutoPhase.BLOCKED, AutoPhase.FAILED},
+    AutoPhase.RUN: {
+        AutoPhase.COMPLETE,
+        AutoPhase.RALPH_HANDOFF,
+        AutoPhase.BLOCKED,
+        AutoPhase.FAILED,
+    },
+    AutoPhase.RALPH_HANDOFF: {
+        AutoPhase.COMPLETE,
+        AutoPhase.BLOCKED,
+        AutoPhase.FAILED,
+    },
     AutoPhase.COMPLETE: set(),
     AutoPhase.BLOCKED: {
         AutoPhase.INTERVIEW,
         AutoPhase.SEED_GENERATION,
         AutoPhase.REVIEW,
         AutoPhase.RUN,
+        AutoPhase.RALPH_HANDOFF,
     },
     AutoPhase.FAILED: {
         AutoPhase.INTERVIEW,
         AutoPhase.SEED_GENERATION,
         AutoPhase.REVIEW,
         AutoPhase.RUN,
+        AutoPhase.RALPH_HANDOFF,
     },
 }
 
@@ -258,6 +266,21 @@ class AutoPipelineState:
     run_reconciliation_status: str | None = None
     run_reconciliation_source: str | None = None
     run_reconciled_at: str | None = None
+    # Ralph handoff persistence (Q00/ouroboros#773). Populated only when
+    # ``--complete-product`` chains RUN → RALPH_HANDOFF after a successful run
+    # handoff. ``ralph_dispatch_mode`` is ``"job"`` for in-process job-manager
+    # dispatches and ``"plugin"`` for OpenCode-plugin delegations. All three
+    # default to None so legacy state files load unchanged.
+    ralph_job_id: str | None = None
+    ralph_lineage_id: str | None = None
+    ralph_dispatch_mode: str | None = None
+    # Q00/ouroboros#773: persisted intent for ``--complete-product`` /
+    # ``complete_product=True``. The flag is durable session state — not a
+    # per-invocation argument — so a session originally started with
+    # ``--complete-product`` keeps chaining RUN → RALPH_HANDOFF on resume even
+    # when the operator forgets to re-pass the flag. Defaults to False so
+    # legacy state files load unchanged.
+    complete_product: bool = False
     ledger: dict[str, Any] = field(default_factory=dict)
     last_grade: str | None = None
     findings: list[dict[str, Any]] = field(default_factory=list)
@@ -510,6 +533,19 @@ class AutoPipelineState:
                 return AutoResumeCapability.PARTIAL_RESUME
             return AutoResumeCapability.NONE
 
+        # Ralph handoff phase. Persisted Ralph handles or plugin dispatch
+        # markers let the pipeline resume without starting duplicate run/Ralph
+        # work; otherwise a Seed is enough to return to the checkpoint and
+        # surface manual recovery guidance.
+        if recoverable == AutoPhase.RALPH_HANDOFF:
+            if any((self.ralph_job_id, self.ralph_lineage_id, self.ralph_dispatch_mode)):
+                return AutoResumeCapability.RESUME
+            if self.seed_artifact:
+                return AutoResumeCapability.RESUME
+            if self.seed_path:
+                return AutoResumeCapability.PARTIAL_RESUME
+            return AutoResumeCapability.NONE
+
         return AutoResumeCapability.NONE  # defensive
 
     def to_dict(self) -> dict[str, Any]:
@@ -544,6 +580,10 @@ class AutoPipelineState:
         payload.setdefault("run_reconciliation_status", None)
         payload.setdefault("run_reconciliation_source", None)
         payload.setdefault("run_reconciled_at", None)
+        payload.setdefault("ralph_job_id", None)
+        payload.setdefault("ralph_lineage_id", None)
+        payload.setdefault("ralph_dispatch_mode", None)
+        payload.setdefault("complete_product", False)
         payload.setdefault("provenance", None)
         payload.setdefault("auto_answer_log", [])
         payload.setdefault("seed_origin", SeedOrigin.NONE.value)
@@ -731,6 +771,9 @@ class AutoPipelineState:
             "run_reconciliation_status",
             "run_reconciliation_source",
             "run_reconciled_at",
+            "ralph_job_id",
+            "ralph_lineage_id",
+            "ralph_dispatch_mode",
             "last_grade",
             "pending_question",
             "last_tool_name",
@@ -746,7 +789,12 @@ class AutoPipelineState:
             if not value.strip():
                 msg = f"{field_name} must be a non-empty string or null"
                 raise ValueError(msg)
-        for field_name in ("interview_completed", "skip_run", "run_start_attempted"):
+        for field_name in (
+            "interview_completed",
+            "skip_run",
+            "run_start_attempted",
+            "complete_product",
+        ):
             if type(getattr(self, field_name)) is not bool:
                 msg = f"{field_name} must be a boolean"
                 raise ValueError(msg)
