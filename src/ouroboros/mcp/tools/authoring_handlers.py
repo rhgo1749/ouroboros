@@ -29,6 +29,8 @@ from ouroboros.bigbang.ambiguity import (
     qualifies_for_seed_completion,
 )
 from ouroboros.bigbang.interview import (
+    INITIAL_CONTEXT_SUMMARY_QUESTION,
+    MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS,
     MIN_ROUNDS_BEFORE_EARLY_EXIT,
     InterviewEngine,
     InterviewState,
@@ -233,6 +235,35 @@ def _format_question_with_ambiguity(question: str, score: AmbiguityScore | None)
     if score is None:
         return question
     return f"(ambiguity: {score.overall_score:.2f}) {question}"
+
+
+def _is_initial_context_length_guard_question(question: str) -> bool:
+    """Return True when ``question`` is the length-guard meta-directive.
+
+    The interview engine surfaces a fixed string as the "next question" when
+    ``initial_context`` exceeds ``MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS``.
+    That string is not a real interview question — it asks the *caller* to
+    re-send a shorter summary — so MCP responses carrying it must carry a
+    distinguishing meta signal.  See Q00/ouroboros#831.
+    """
+    return question == INITIAL_CONTEXT_SUMMARY_QUESTION
+
+
+def _length_guard_meta_fields() -> dict[str, Any]:
+    """Return the meta keys that mark a length-guard response.
+
+    The handler merges these into the existing ``meta`` dict (``session_id``,
+    ``ambiguity_score``, etc.) when the returned question is the length-guard
+    meta-directive.  Clients can branch on ``meta.reason`` to handle the case
+    programmatically instead of mis-routing the question to a human via
+    AskUserQuestion.
+    """
+    return {
+        "recoverable": True,
+        "reason": "initial_context_too_large",
+        "expected_action": "resend_with_summary",
+        "max_chars": MAX_PROMPT_SAFE_INITIAL_CONTEXT_CHARS,
+    }
 
 
 def _ambiguity_warning_for_failed_question(
@@ -1435,6 +1466,27 @@ class InterviewHandler:
                     session_id=state.interview_id,
                 )
 
+                is_length_guard = _is_initial_context_length_guard_question(question)
+                start_meta: dict[str, Any] = {
+                    "session_id": state.interview_id,
+                    "ambiguity_score": (
+                        live_score.overall_score if live_score is not None else None
+                    ),
+                    "milestone": _milestone_for_score(live_score),
+                    "seed_ready": (
+                        live_score.is_ready_for_seed if live_score is not None else None
+                    ),
+                }
+                if is_length_guard:
+                    # Q00/ouroboros#831: surface the length-guard meta-directive
+                    # via structured meta keys so clients can branch on
+                    # ``meta.reason`` instead of mis-routing the text body to a
+                    # human via AskUserQuestion.  ``is_error`` is intentionally
+                    # left ``False`` -- the wire success/failure axis must not
+                    # flip or ``HandlerInterviewBackend.start`` (auto driver)
+                    # would raise on every oversized ``initial_context`` where
+                    # it previously delivered the summarize question.
+                    start_meta.update(_length_guard_meta_fields())
                 return Result.ok(
                     MCPToolResult(
                         content=(
@@ -1447,16 +1499,7 @@ class InterviewHandler:
                             ),
                         ),
                         is_error=False,
-                        meta={
-                            "session_id": state.interview_id,
-                            "ambiguity_score": (
-                                live_score.overall_score if live_score is not None else None
-                            ),
-                            "milestone": _milestone_for_score(live_score),
-                            "seed_ready": (
-                                live_score.is_ready_for_seed if live_score is not None else None
-                            ),
-                        },
+                        meta=start_meta,
                     )
                 )
 
@@ -1475,10 +1518,34 @@ class InterviewHandler:
                 _interview_id = session_id
 
                 if not answer and state.rounds and state.rounds[-1].user_response is None:
+                    pending_question = state.rounds[-1].question
                     display_question = _format_question_with_ambiguity(
-                        state.rounds[-1].question,
+                        pending_question,
                         _load_state_ambiguity_score(state),
                     )
+                    resume_is_length_guard = _is_initial_context_length_guard_question(
+                        pending_question
+                    )
+                    resume_meta: dict[str, Any] = {
+                        "session_id": session_id,
+                        "ambiguity_score": state.ambiguity_score,
+                        "milestone": (
+                            get_milestone(state.ambiguity_score)[0].value
+                            if state.ambiguity_score is not None
+                            else None
+                        ),
+                        "seed_ready": (
+                            state.ambiguity_score is not None
+                            and state.ambiguity_score <= AMBIGUITY_THRESHOLD
+                        ),
+                    }
+                    if resume_is_length_guard:
+                        # Q00/ouroboros#831: structured signal when resuming
+                        # an interview whose pending round is the length-guard
+                        # meta-directive.  ``is_error`` stays ``False`` so
+                        # callers like the auto driver do not treat the
+                        # summarize prompt as a hard failure.
+                        resume_meta.update(_length_guard_meta_fields())
                     return Result.ok(
                         MCPToolResult(
                             content=(
@@ -1488,19 +1555,7 @@ class InterviewHandler:
                                 ),
                             ),
                             is_error=False,
-                            meta={
-                                "session_id": session_id,
-                                "ambiguity_score": state.ambiguity_score,
-                                "milestone": (
-                                    get_milestone(state.ambiguity_score)[0].value
-                                    if state.ambiguity_score is not None
-                                    else None
-                                ),
-                                "seed_ready": (
-                                    state.ambiguity_score is not None
-                                    and state.ambiguity_score <= AMBIGUITY_THRESHOLD
-                                ),
-                            },
+                            meta=resume_meta,
                         )
                     )
 
@@ -1844,6 +1899,25 @@ class InterviewHandler:
                     session_id=session_id,
                 )
 
+                answer_is_length_guard = _is_initial_context_length_guard_question(question)
+                answer_meta: dict[str, Any] = {
+                    "session_id": session_id,
+                    "ambiguity_score": (
+                        live_score.overall_score if live_score is not None else None
+                    ),
+                    "milestone": _milestone_for_score(live_score),
+                    "seed_ready": (
+                        live_score.is_ready_for_seed if live_score is not None else None
+                    ),
+                }
+                if answer_is_length_guard:
+                    # Q00/ouroboros#831: structured signal when the next
+                    # question after an answer is again the length-guard
+                    # meta-directive (the post-answer scoring path may still
+                    # require the user to summarize before continuing).
+                    # ``is_error`` stays ``False`` so the auto driver's
+                    # ``answer()`` path is not raised on.
+                    answer_meta.update(_length_guard_meta_fields())
                 return Result.ok(
                     MCPToolResult(
                         content=(
@@ -1853,16 +1927,7 @@ class InterviewHandler:
                             ),
                         ),
                         is_error=False,
-                        meta={
-                            "session_id": session_id,
-                            "ambiguity_score": (
-                                live_score.overall_score if live_score is not None else None
-                            ),
-                            "milestone": _milestone_for_score(live_score),
-                            "seed_ready": (
-                                live_score.is_ready_for_seed if live_score is not None else None
-                            ),
-                        },
+                        meta=answer_meta,
                     )
                 )
 
