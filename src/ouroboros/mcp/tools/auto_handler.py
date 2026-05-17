@@ -28,6 +28,10 @@ from ouroboros.auto.answerer import (
     AutoAnswerContext,
     risky_user_preference_blocker_for,
 )
+from ouroboros.auto.execution_acceptance import (
+    has_auto_wrapper_context,
+    is_auto_reporting_acceptance_criterion,
+)
 from ouroboros.auto.interview_driver import AutoInterviewDriver
 from ouroboros.auto.ledger import (
     REQUIRED_SECTIONS,
@@ -1520,7 +1524,9 @@ def _derive_goal_user_preferences(goal: str) -> dict[str, str]:
 
     success = _section_text(sections, "success criteria", "acceptance criteria")
     if success:
-        preferences["acceptance_criteria"] = success
+        execution_success = _execution_success_criteria(success, context_text=goal)
+        if execution_success:
+            preferences["acceptance_criteria"] = execution_success
 
     outputs = _section_text(sections, "outputs", "deliverables")
     if outputs:
@@ -1597,6 +1603,16 @@ def _section_text(sections: dict[str, list[str]], *names: str) -> str:
     for name in names:
         values.extend(sections.get(" ".join(name.replace("_", " ").casefold().split()), ()))
     return "\n".join(dict.fromkeys(value for value in values if value.strip()))
+
+
+def _execution_success_criteria(text: str, *, context_text: str = "") -> str:
+    strip_auto_wrapper = has_auto_wrapper_context("\n".join((context_text, text)))
+    lines = [
+        line
+        for line in (_clean_prompt_line(raw) for raw in text.splitlines())
+        if line and not (strip_auto_wrapper and is_auto_reporting_acceptance_criterion(line))
+    ]
+    return "\n".join(dict.fromkeys(lines))
 
 
 def _matching_lines(text: str, needles: tuple[str, ...]) -> list[str]:

@@ -226,6 +226,8 @@ def test_structured_auto_goal_seeds_required_ledger_sections() -> None:
     assert "runtime_context" in summary["evidence_backed_sections"]
     assert "constraints" in summary["evidence_backed_sections"]
     assert "non_goals" in summary["evidence_backed_sections"]
+    assert "Final report" not in preferences["acceptance_criteria"]
+    assert "`hello_auto.py` exists" in preferences["acceptance_criteria"]
 
 
 def test_structured_auto_goal_does_not_preconfirm_risky_preference() -> None:
@@ -246,7 +248,6 @@ Success criteria:
     preferences = _derive_goal_user_preferences(risky_goal)
 
     assert "outputs" in preferences
-    assert "acceptance_criteria" in preferences
     ledger = _seed_initial_ledger_from_user_preferences(risky_goal, preferences)
 
     assert "outputs" not in ledger.summary()["evidence_backed_sections"]
@@ -267,6 +268,78 @@ Implementation:
 
     assert "outputs" not in preferences
     assert "inputs" not in preferences
+
+
+def test_structured_auto_goal_filters_report_only_success_criteria() -> None:
+    preferences = _derive_goal_user_preferences(_OBSERVATION_GOAL)
+
+    assert "acceptance_criteria" in preferences
+    assert "manual fallback" not in preferences["acceptance_criteria"].casefold()
+    assert "seed id" not in preferences["acceptance_criteria"].casefold()
+    assert "uv run pytest tests/test_hello_auto.py" in preferences["acceptance_criteria"]
+
+
+def test_structured_auto_goal_preserves_non_allowlisted_execution_criteria() -> None:
+    goal = """
+Goal:
+Build a CLI validation endpoint.
+
+Success criteria:
+- `validator.py` exists.
+- CLI exits 2 on invalid flags.
+- HTTP 400 responses include a machine-readable error code.
+- JSON output matches the documented schema.
+- The command prints exactly `hello from ooo auto`.
+- Final report includes auto session id, seed id, seed path, and test result.
+"""
+
+    preferences = _derive_goal_user_preferences(goal)
+
+    assert preferences["acceptance_criteria"] == (
+        "`validator.py` exists.\n"
+        "CLI exits 2 on invalid flags.\n"
+        "HTTP 400 responses include a machine-readable error code.\n"
+        "JSON output matches the documented schema.\n"
+        "The command prints exactly `hello from ooo auto`.\n"
+        "Final report includes auto session id, seed id, seed path, and test result."
+    )
+
+
+def test_structured_auto_goal_filters_wrapper_criteria_using_full_prompt_context() -> None:
+    goal = """
+Goal:
+Verify current ooo auto can create hello_auto.py and tests/test_hello_auto.py.
+
+Success criteria:
+- `hello_auto.py` exists.
+- `tests/test_hello_auto.py` exists.
+- Final report includes auto session id, seed id, seed path, and test result.
+
+Important dispatch rule:
+If `ouroboros_auto` is unavailable or interpreted as normal text, stop and report failure.
+"""
+
+    preferences = _derive_goal_user_preferences(goal)
+
+    assert preferences["acceptance_criteria"] == (
+        "`hello_auto.py` exists.\n`tests/test_hello_auto.py` exists."
+    )
+
+
+def test_structured_product_goal_preserves_exact_final_report_metadata_requirement() -> None:
+    goal = """
+Goal:
+Build a product final-report endpoint.
+
+Success criteria:
+- Final report includes auto session id, seed id, seed path, and test result.
+"""
+
+    preferences = _derive_goal_user_preferences(goal)
+
+    assert preferences["acceptance_criteria"] == (
+        "Final report includes auto session id, seed id, seed path, and test result."
+    )
 
 
 def test_resume_preference_override_reseeds_stale_preconfirmed_ledger() -> None:
