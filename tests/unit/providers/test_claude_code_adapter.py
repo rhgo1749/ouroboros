@@ -250,6 +250,35 @@ class TestExecuteSingleRequestSystemPrompt:
         assert "system_prompt" not in options_call_kwargs
 
 
+class TestResolveCliPathPreservesPublicContract:
+    """The explicit cli_path override keeps its pre-hardening behavior.
+
+    The untrusted-.env trust boundary is enforced in config.loader, so the
+    adapter must NOT second-guess the provenance of an explicit path:
+    a relative wrapper override still resolves relative to the cwd.
+    """
+
+    def test_relative_explicit_override_resolves_against_cwd(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.chdir(tmp_path)
+        wrapper = tmp_path / "claude-wrapper"
+        wrapper.write_text("#!/bin/sh\n")
+        wrapper.chmod(0o755)
+
+        adapter = ClaudeCodeAdapter(cli_path="./claude-wrapper")
+
+        assert adapter._cli_path == wrapper.resolve()
+
+    def test_absolute_override_is_accepted(self, tmp_path) -> None:
+        binary = tmp_path / "bin" / "claude"
+        binary.parent.mkdir()
+        binary.write_text("#!/bin/sh\n")
+        binary.chmod(0o755)
+
+        adapter = ClaudeCodeAdapter(cli_path=str(binary))
+
+        assert adapter._cli_path == binary.resolve()
+
+
 class TestAdapterOverheadReductions:
     """Test per-call overhead optimizations in ClaudeCodeAdapter."""
 
