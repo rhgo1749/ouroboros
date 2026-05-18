@@ -6,6 +6,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 import importlib.resources
+import os
 from pathlib import Path
 import shutil
 from typing import Literal
@@ -301,6 +302,60 @@ def _remove_installed_artifact(path: Path) -> None:
     path.unlink()
 
 
+def _prepare_managed_install_root(path: Path) -> None:
+    """Create an artifact root without following attacker-controlled symlinks."""
+    _refuse_symlinked_path_component(path)
+    path.mkdir(parents=True, exist_ok=True)
+    _refuse_symlinked_path_component(path)
+
+
+def _refuse_symlinked_path_component(path: Path) -> None:
+    """Fail closed when any existing component in an install root is a symlink."""
+    for candidate_path in _install_root_candidates(path):
+        _refuse_symlinked_candidate_path_component(candidate_path)
+
+
+def _install_root_candidates(path: Path) -> tuple[Path, ...]:
+    """Return filesystem paths that may be followed for an install root."""
+    if path.is_absolute():
+        return (path,)
+
+    candidates = [Path.cwd() / path]
+    pwd = os.environ.get("PWD")
+    if not pwd:
+        return tuple(candidates)
+
+    pwd_path = Path(pwd).expanduser()
+    if not pwd_path.is_absolute():
+        return tuple(candidates)
+
+    try:
+        pwd_matches_cwd = pwd_path.resolve(strict=True) == Path.cwd().resolve(strict=True)
+    except OSError:
+        pwd_matches_cwd = False
+    if pwd_matches_cwd:
+        candidates.append(pwd_path / path)
+
+    return tuple(dict.fromkeys(candidates))
+
+
+def _refuse_symlinked_candidate_path_component(path: Path) -> None:
+    """Fail closed when any existing component in one install-root candidate is a symlink."""
+    for component in (*reversed(path.parents), path):
+        if not component.is_symlink():
+            continue
+        msg = (
+            "Refusing to install Codex artifacts into a path with a symlinked "
+            f"directory component: {component}"
+        )
+        raise OSError(msg)
+
+
+def _installed_artifact_exists(path: Path) -> bool:
+    """Return whether an installed artifact path occupies the leaf, including symlinks."""
+    return path.exists() or path.is_symlink()
+
+
 def _is_namespaced_rule_artifact(path: Path) -> bool:
     """Return whether a rules entry is managed by Ouroboros."""
     if path.name == CODEX_RULE_FILENAME:
@@ -321,7 +376,7 @@ def install_codex_rules(
         Path(codex_dir).expanduser() if codex_dir is not None else Path.home() / ".codex"
     )
     target_root = resolved_codex_dir / "rules"
-    target_root.mkdir(parents=True, exist_ok=True)
+    _prepare_managed_install_root(target_root)
 
     installed_names: set[str] = set()
     primary_target_path: Path | None = None
@@ -332,7 +387,7 @@ def install_codex_rules(
         primary_source_path = _select_primary_packaged_codex_rule(packaged_rules)
         for source_path in packaged_rules:
             target_path = target_root / source_path.name
-            if target_path.exists():
+            if _installed_artifact_exists(target_path):
                 _remove_installed_artifact(target_path)
 
             if source_path == primary_source_path:
@@ -370,7 +425,7 @@ def install_codex_skills(
         Path(codex_dir).expanduser() if codex_dir is not None else Path.home() / ".codex"
     )
     target_root = resolved_codex_dir / "skills"
-    target_root.mkdir(parents=True, exist_ok=True)
+    _prepare_managed_install_root(target_root)
 
     installed_paths: list[Path] = []
     with _packaged_codex_skills_dir(skills_dir=skills_dir) as source_root:
@@ -379,7 +434,7 @@ def install_codex_skills(
 
         for packaged_skill in packaged_skills:
             target_path = target_root / packaged_skill.install_dir_name
-            if target_path.exists():
+            if _installed_artifact_exists(target_path):
                 _remove_installed_artifact(target_path)
 
             shutil.copytree(packaged_skill.source_dir, target_path)
