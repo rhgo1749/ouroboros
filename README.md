@@ -18,7 +18,7 @@
 <p align="center">
   <strong>Stop prompting. Start specifying.</strong>
   <br/>
-  <sub>Agent OS for replayable, specification-first AI coding workflows</sub>
+  <sub>The <strong>Agent OS</strong> for replayable, specification-first AI coding workflows</sub>
 </p>
 
 <p align="center">
@@ -38,11 +38,51 @@
 
 **Turn a vague idea into a verified, working codebase -- across Claude Code, Codex CLI, OpenCode, and Hermes.**
 
-Ouroboros is an Agent OS for AI coding: a local-first runtime layer that turns
-non-deterministic agent work into a replayable, observable, policy-bound
+Ouroboros is an **Agent OS** for AI coding: a local-first runtime layer that
+turns non-deterministic agent work into a replayable, observable, policy-bound
 execution contract. It replaces ad-hoc prompting with a structured
 specification-first workflow: interview, crystallize, execute, evaluate,
 evolve.
+
+---
+
+## The Ouroboros Agent OS Stack
+
+Like any OS, Ouroboros is split into a stable **OS layer** of primitives, an
+**application layer** of domain workflows, and a **shell** that humans actually
+sit in front of. Three repos, one stack:
+
+| Layer | Repo | Role | What it gives you |
+| :--- | :--- | :--- | :--- |
+| **Shell** (terminal client) | [`Q00/ourocode`](https://github.com/Q00/ourocode) | Native terminal UI for running `ooo` workflows across Claude / Codex / Gemini CLIs in one session | TUI, wonderTool decision pickers, MCP pane state, command discovery |
+| **Apps** (domain workflows) | [`Q00/ouroboros-plugins`](https://github.com/Q00/ouroboros-plugins) | UserLevel plugin contract — composes core primitives into installable domain programs (PR ops, Jira sync, incidents, releases) | Plugin manifest, scoped permissions, audit/provenance, reference plugins |
+| **OS** (this repo) | [`Q00/ouroboros`](https://github.com/Q00/ouroboros) | Agent OS core — Seed, Ledger, Runtime, MCP, safety boundaries | `ooo` commands, spec-first workflow engine, multi-runtime adapter |
+
+**How they connect:**
+
+```
+  ourocode  ──►  ooo / ouroboros-plugins  ──►  ouroboros core (Seed · Ledger · MCP · Runtime)
+   shell             user-level apps                        kernel
+```
+
+- The **kernel** (`ouroboros`) owns the contract: every action becomes a
+  Seed-bound, ledger-recorded, replayable event — regardless of which LLM
+  executes it.
+- **Plugins** (`ouroboros-plugins`) declare scoped capabilities against that
+  contract, so domain workflows (review a PR, triage a Linear ticket, run a
+  release) stay auditable and policy-bound instead of being one-off prompts.
+- **Ourocode** is the terminal shell: it surfaces MCP state, interview
+  questions, and wonderTool decisions as first-class TUI elements, so you can
+  drive the OS without leaving the keyboard or switching between CLIs.
+
+Use `ouroboros` alone with any supported CLI, layer plugins on for domain
+workflows, or install `ourocode` when you want a unified terminal cockpit.
+
+> **Disclaimer.** The Ouroboros project and community are **not affiliated with
+> any cryptocurrency, token, memecoin, or trading community** — including, but
+> not limited to, any "ouroboros" tickers on pump.fun or other launchpads. This
+> is an open-source developer tool. We do not issue, endorse, or hold any
+> coins. Any token claiming association with this project is unauthorized.
 
 ---
 
